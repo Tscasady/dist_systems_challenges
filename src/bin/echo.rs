@@ -16,7 +16,7 @@ impl Node for EchoNode {
             Payload::Init {..} => {
                 let reply = Message {
                     src: input.dest,
-                    dest: input.src,
+   dest: input.src,
                     body: MsgBody {
                         msg_id: Some(self.id),
                         in_reply_to: input.body.msg_id,

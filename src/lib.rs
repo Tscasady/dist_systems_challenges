@@ -21,6 +21,8 @@ pub struct MsgBody<Payload> {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Payload {
+    Generate,
+    GenerateOk {id: String }, 
     Init {
         node_id: String,
         node_ids: Vec<String>,
@@ -35,10 +37,10 @@ pub enum Payload {
     Error,
 }
 
-pub struct Init {
-    node_id: String,
-    node_ids: Vec<String>,
-}
+// pub struct Init {
+//     node_id: String,
+//     node_ids: Vec<String>,
+// }
 
 pub trait Node {
     fn reply(&mut self, input: Message, output: &mut StdoutLock) -> anyhow::Result<()>;
