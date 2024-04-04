@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::io::{stdin, stdout, StdoutLock};
 use anyhow::Context;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::io::{stdin, stdout, StdoutLock};
 
 #[derive(Serialize, Deserialize)]
-pub struct Message {
+pub struct Message<Payload> {
     pub src: String,
     pub dest: String,
     pub body: MsgBody<Payload>,
@@ -17,43 +17,55 @@ pub struct MsgBody<Payload> {
     pub payload: Payload,
 }
 
+pub trait Payload {}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-pub enum Payload {
-    Generate,
-    GenerateOk {id: String }, 
+pub enum InitPayload {
     Init {
         node_id: String,
         node_ids: Vec<String>,
     },
     InitOk,
-    Echo {
-        echo: String,
-    },
-    EchoOk {
-        echo: String,
-    },
-    Error,
 }
 
-// pub struct Init {
-//     node_id: String,
-//     node_ids: Vec<String>,
-// }
+impl Payload for InitPayload {}
+
+pub trait NodeBuilder<N: Node> {
+    fn build(self, msg: Message<InitPayload>, output: &mut StdoutLock) -> anyhow::Result<N>;
+}
 
 pub trait Node {
-    fn reply(&mut self, input: Message, output: &mut StdoutLock) -> anyhow::Result<()>;
+    type Payload: Payload;
+    fn reply(&mut self, input: Message<Self::Payload>, output: &mut StdoutLock) -> anyhow::Result<()>;
 }
-pub fn service<N: Node>(mut node: N) -> anyhow::Result<()> {
-    let stdin = stdin().lock();
+
+pub fn service<NB, N>(node_builder: NB) -> anyhow::Result<()>
+where
+    NB: NodeBuilder<N>,
+    N: Node,
+    <N as Node>::Payload: DeserializeOwned
+{
+    let mut stdin = stdin().lines();
     let mut stdout = stdout().lock();
 
-    let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message>();
-    for input in inputs {
-        let input = input.context("couldn't deserialize message")?;
+    let init_msg: Message<InitPayload> = serde_json::from_str(
+        &stdin
+            .next()
+            .expect("first message should be init")
+            .context("failed to read init from stdin")?,
+    )
+    .context("init couldn't be deserde'd")?;
+
+    let mut node = node_builder.build(init_msg, &mut stdout)?;
+
+    for line in stdin {
+        let line = line.context("input from stdin couldn't be read")?;
+        let input: Message<N::Payload> = serde_json::from_str(&line).context("couldn't deserialize message")?;
         node.reply(input, &mut stdout)?
     }
 
     Ok(())
 }
+
