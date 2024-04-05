@@ -1,13 +1,15 @@
 use anyhow::Context;
 use dist_systems_challenge::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::io::{StdoutLock, Write};
 
 #[derive(Serialize, Deserialize)]
 struct BroadcastNode {
     id: String,
     msg_id: usize,
-    read: Vec<usize>,
+    messages: HashSet<usize>,
+    cluster: Vec<String>,
 }
 
 struct BroadcastNodeBuilder;
@@ -35,7 +37,8 @@ impl NodeBuilder<BroadcastNode> for BroadcastNodeBuilder {
             return Ok(BroadcastNode {
                 id: node_id,
                 msg_id: 0,
-                read: vec![],
+                messages: HashSet::new(),
+                cluster: vec![],
             });
         } else {
             panic!()
@@ -53,9 +56,9 @@ impl Node for BroadcastNode {
     ) -> anyhow::Result<()> {
         match input.body.payload {
             Self::Payload::Broadcast { message } => {
-                self.read.push(message);
+                self.messages.insert(message);
                 let reply = Message {
-                    src: input.dest,
+                    src: input.dest.clone(),
                     dest: input.src,
                     body: MsgBody {
                         msg_id: Some(self.msg_id),
@@ -67,6 +70,21 @@ impl Node for BroadcastNode {
                     .context("serialize response to broadcast msg")?;
                 output.write_all(b"\n").context("add newline")?;
                 self.msg_id += 1;
+
+                for node in &self.cluster {
+                    let gossip = Message {
+                        src: input.dest.clone(),
+                        dest: node.to_string(),
+                        body: MsgBody {
+                            msg_id: Some(self.msg_id),
+                            in_reply_to: input.body.msg_id,
+                            payload: Self::Payload::Gossip { message },
+                        },
+                    };
+                    serde_json::to_writer(&mut *output, &gossip).context("serialize gossip msg")?;
+                    output.write_all(b"\n").context("add newline")?;
+                    self.msg_id += 1;
+                }
             }
             Self::Payload::Read => {
                 let reply = Message {
@@ -76,7 +94,7 @@ impl Node for BroadcastNode {
                         msg_id: Some(self.msg_id),
                         in_reply_to: input.body.msg_id,
                         payload: Self::Payload::ReadOk {
-                            messages: self.read.clone(),
+                            messages: self.messages.clone(),
                         },
                     },
                 };
@@ -85,7 +103,8 @@ impl Node for BroadcastNode {
                 output.write_all(b"\n").context("add newline")?;
                 self.msg_id += 1;
             }
-            Self::Payload::Topology => {
+            Self::Payload::Topology { topology } => {
+                self.cluster = topology.get(&self.id).unwrap().clone();
                 let reply = Message {
                     src: input.dest,
                     dest: input.src,
@@ -100,6 +119,25 @@ impl Node for BroadcastNode {
                 output.write_all(b"\n").context("add newline")?;
                 self.msg_id += 1;
             }
+            Self::Payload::Gossip { message } => {
+                if self.messages.insert(message) {
+                    for node in &self.cluster {
+                        let gossip = Message {
+                            src: input.dest.clone(),
+                            dest: node.to_string(),
+                            body: MsgBody {
+                                msg_id: Some(self.msg_id),
+                                in_reply_to: input.body.msg_id,
+                                payload: Self::Payload::Gossip { message },
+                            },
+                        };
+                        serde_json::to_writer(&mut *output, &gossip)
+                            .context("serialize gossip msg")?;
+                        output.write_all(b"\n").context("add newline")?;
+                        self.msg_id += 1;
+                    }
+                };
+            }
             _ => {}
         }
         Ok(())
@@ -110,11 +148,20 @@ impl Node for BroadcastNode {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcastPayload {
-    Broadcast { message: usize },
+    Gossip {
+        message: usize,
+    },
+    Broadcast {
+        message: usize,
+    },
     BroadcastOk,
     Read,
-    ReadOk { messages: Vec<usize> },
-    Topology,
+    ReadOk {
+        messages: HashSet<usize>,
+    },
+    Topology {
+        topology: HashMap<String, Vec<String>>,
+    },
     TopologyOk,
     Error,
 }
