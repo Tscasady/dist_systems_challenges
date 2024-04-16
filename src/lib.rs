@@ -1,12 +1,86 @@
 use anyhow::Context;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::io::{stdin, stdout, StdoutLock};
+use std::io::{stdin, stdout, StdoutLock, Write};
+use std::sync::mpsc::{channel, Sender};
+use std::thread;
 
 #[derive(Serialize, Deserialize)]
 pub struct Message<Payload> {
     pub src: String,
     pub dest: String,
     pub body: MsgBody<Payload>,
+}
+
+impl<Payload> Message<Payload> {
+    pub fn into_reply(self, id: Option<usize>, payload: Payload) -> MessageBuilder<Payload> {
+        MessageBuilder::empty()
+            .from(self.src)
+            .to(self.dest)
+            .with_body(id, self.body.msg_id, payload)
+    }
+
+    // fn new() -> Self {
+    //     todo!()
+    // }
+
+    pub fn write(self, output: &mut StdoutLock) -> anyhow::Result<()>
+    where
+        Payload: Serialize,
+    {
+        serde_json::to_writer(&mut *output, &self).context("serialize message")?;
+        output.write_all(b"\n").context("add newline")?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MessageBuilder<Payload> {
+    pub src: Option<String>,
+    pub dest: Option<String>,
+    pub body: Option<MsgBody<Payload>>,
+}
+
+impl<Payload> MessageBuilder<Payload> {
+    fn empty() -> Self {
+        MessageBuilder {
+            src: None,
+            dest: None,
+            body: None,
+        }
+    }
+
+    fn to(mut self, dest: String) -> Self {
+        self.src = Some(dest);
+        self
+    }
+
+    fn from(mut self, src: String) -> Self {
+        self.dest = Some(src);
+        self
+    }
+
+    fn with_body(
+        mut self,
+        msg_id: Option<usize>,
+        in_reply_to: Option<usize>,
+        payload: Payload,
+    ) -> Self {
+        self.body = Some(MsgBody {
+            msg_id,
+            in_reply_to,
+            payload,
+        });
+        self
+    }
+
+    pub fn write(self, output: &mut StdoutLock) -> anyhow::Result<()>
+    where
+        Payload: Serialize,
+    {
+        serde_json::to_writer(&mut *output, &self).context("serialize message")?;
+        output.write_all(b"\n").context("add newline")?;
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,24 +106,30 @@ pub enum InitPayload {
 
 impl Payload for InitPayload {}
 
-pub trait NodeBuilder<N: Node> {
-    fn build(self, msg: Message<InitPayload>, output: &mut StdoutLock) -> anyhow::Result<N>;
-}
-
-pub trait Node {
+pub trait Node: Sized {
     type Payload: Payload;
-    fn reply(&mut self, input: Message<Self::Payload>, output: &mut StdoutLock) -> anyhow::Result<()>;
+    fn new(
+        msg: Message<InitPayload>,
+        output: &mut StdoutLock,
+        tx: Sender<Message<Self::Payload>>,
+    ) -> anyhow::Result<Self>;
+
+    fn reply(
+        &mut self,
+        input: Message<Self::Payload>,
+        output: &mut StdoutLock,
+    ) -> anyhow::Result<()>;
 }
 
-pub fn service<NB, N>(node_builder: NB) -> anyhow::Result<()>
+pub fn service<N>() -> anyhow::Result<()>
 where
-    NB: NodeBuilder<N>,
     N: Node,
-    <N as Node>::Payload: DeserializeOwned
+    N::Payload: DeserializeOwned + Sync + Send + 'static,
 {
     let mut stdin = stdin().lines();
     let mut stdout = stdout().lock();
 
+    let (sender, receiver) = channel::<Message<N::Payload>>();
     let init_msg: Message<InitPayload> = serde_json::from_str(
         &stdin
             .next()
@@ -58,14 +138,31 @@ where
     )
     .context("init couldn't be deserde'd")?;
 
-    let mut node = node_builder.build(init_msg, &mut stdout)?;
+    let mut node = N::new(init_msg, &mut stdout, sender.clone())?;
 
-    for line in stdin {
-        let line = line.context("input from stdin couldn't be read")?;
-        let input: Message<N::Payload> = serde_json::from_str(&line).context("couldn't deserialize message")?;
-        node.reply(input, &mut stdout)?
+    let stdin_sender = sender.clone();
+    drop(stdin);
+    let handle = thread::spawn(move || {
+        let stdin = std::io::stdin().lines();
+        for line in stdin {
+            let line = line.context("input from stdin couldn't be read")?;
+            let input: Message<N::Payload> =
+                serde_json::from_str(&line).context("couldn't deserialize message")?;
+            if let Err(_) = stdin_sender.send(input) {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+        Ok(())
+    });
+
+    for input in receiver {
+        node.reply(input, &mut stdout).context("couldn't reply")?
     }
+
+    handle
+        .join()
+        .expect("stdin thread panicked")
+        .context("stdin thread err'd")?;
 
     Ok(())
 }
-

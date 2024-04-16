@@ -1,8 +1,11 @@
+use ::std::thread;
 use anyhow::Context;
 use dist_systems_challenge::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{StdoutLock, Write};
+use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
 struct BroadcastNode {
@@ -12,15 +15,15 @@ struct BroadcastNode {
     cluster: Vec<String>,
 }
 
-struct BroadcastNodeBuilder;
+impl Node for BroadcastNode {
+    type Payload = BroadcastPayload;
 
-impl NodeBuilder<BroadcastNode> for BroadcastNodeBuilder {
-    fn build(
-        self,
+    fn new(
         msg: Message<InitPayload>,
         output: &mut StdoutLock,
+        gossip_trigger: Sender<Message<BroadcastPayload>>,
     ) -> anyhow::Result<BroadcastNode> {
-        if let InitPayload::Init { node_id, .. } = msg.body.payload {
+        let node = if let InitPayload::Init { node_id, .. } = msg.body.payload {
             let reply = Message {
                 src: msg.dest,
                 dest: msg.src,
@@ -34,20 +37,36 @@ impl NodeBuilder<BroadcastNode> for BroadcastNodeBuilder {
                 .context("serialize response to broadcast init")?;
             output.write_all(b"\n").context("add newline")?;
 
-            return Ok(BroadcastNode {
+            BroadcastNode {
                 id: node_id,
                 msg_id: 0,
                 messages: HashSet::new(),
                 cluster: vec![],
-            });
+            }
         } else {
             panic!()
-        }
-    }
-}
+        };
 
-impl Node for BroadcastNode {
-    type Payload = BroadcastPayload;
+        let gossip_timer = 500;
+
+        thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(gossip_timer));
+
+            if let Err(_) = gossip_trigger.send(Message {
+                src: "".to_string(),
+                dest: "".to_string(),
+                body: MsgBody {
+                    msg_id: None,
+                    in_reply_to: None,
+                    payload: BroadcastPayload::TriggerGossip,
+                },
+            }) {
+                break;
+            }
+        });
+
+        return Ok(node);
+    }
 
     fn reply(
         &mut self,
@@ -148,6 +167,7 @@ impl Node for BroadcastNode {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcastPayload {
+    TriggerGossip,
     Gossip {
         message: usize,
     },
@@ -163,11 +183,10 @@ pub enum BroadcastPayload {
         topology: HashMap<String, Vec<String>>,
     },
     TopologyOk,
-    Error,
 }
 
 impl Payload for BroadcastPayload {}
 
 fn main() -> anyhow::Result<()> {
-    service(BroadcastNodeBuilder {})
+    service::<BroadcastNode>()
 }

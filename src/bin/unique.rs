@@ -1,7 +1,7 @@
 use anyhow::Context;
 use dist_systems_challenge::*;
 use serde::{Deserialize, Serialize};
-use std::io::{StdoutLock, Write};
+use std::{io::{StdoutLock, Write}, sync::mpsc::Sender};
 
 #[derive(Serialize, Deserialize)]
 struct UniqueNode {
@@ -9,10 +9,10 @@ struct UniqueNode {
     msg_id: usize,
 }
 
-struct UniqueNodeBuilder;
+impl Node for UniqueNode {
+    type Payload = UniquePayload;
 
-impl NodeBuilder<UniqueNode> for UniqueNodeBuilder {
-    fn build(self, msg: Message<InitPayload>, output: &mut StdoutLock) -> anyhow::Result<UniqueNode>
+    fn new(msg: Message<InitPayload>, output: &mut StdoutLock, _tx: Sender<Message<UniquePayload>>) -> anyhow::Result<UniqueNode>
     {
         if let InitPayload::Init { node_id, .. } = msg.body.payload {
             let reply = Message {
@@ -35,10 +35,7 @@ impl NodeBuilder<UniqueNode> for UniqueNodeBuilder {
             panic!()
         }
     }
-}
 
-impl Node for UniqueNode {
-    type Payload = UniquePayload;
     fn reply(
         &mut self,
         input: dist_systems_challenge::Message<Self::Payload>,
@@ -78,5 +75,5 @@ enum UniquePayload {
 impl Payload for UniquePayload {}
 
 fn main() -> anyhow::Result<()> {
-    service(UniqueNodeBuilder {})
+    service::<UniqueNode>()
 }
