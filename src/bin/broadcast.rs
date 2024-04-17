@@ -1,9 +1,8 @@
 use ::std::thread;
-use anyhow::Context;
 use dist_systems_challenge::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{StdoutLock, Write};
+use std::io::StdoutLock;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -13,54 +12,47 @@ struct BroadcastNode {
     msg_id: usize,
     messages: HashSet<usize>,
     cluster: Vec<String>,
+    unconfirmed: HashMap<String, HashSet<usize>>,
 }
 
 impl Node for BroadcastNode {
     type Payload = BroadcastPayload;
 
     fn new(
-        msg: Message<InitPayload>,
+        mut msg: Message<InitPayload>,
         output: &mut StdoutLock,
         gossip_trigger: Sender<Message<BroadcastPayload>>,
     ) -> anyhow::Result<BroadcastNode> {
-        let node = if let InitPayload::Init { node_id, .. } = msg.body.payload {
-            let reply = Message {
-                src: msg.dest,
-                dest: msg.src,
-                body: MsgBody {
-                    msg_id: Some(0),
-                    in_reply_to: msg.body.msg_id,
-                    payload: InitPayload::InitOk,
-                },
-            };
-            serde_json::to_writer(&mut *output, &reply)
-                .context("serialize response to broadcast init")?;
-            output.write_all(b"\n").context("add newline")?;
+        let node = if let InitPayload::Init { node_id, .. } =
+            std::mem::replace(&mut msg.body.payload, InitPayload::Empty)
+        {
+            msg.into_reply(Some(0), InitPayload::InitOk)
+                .write(&mut *output)?;
 
             BroadcastNode {
                 id: node_id,
                 msg_id: 0,
                 messages: HashSet::new(),
                 cluster: vec![],
+                unconfirmed: HashMap::new(),
             }
         } else {
             panic!()
         };
 
-        let gossip_timer = 500;
+        let gossip_timer = 300;
 
+        let node_id = node.id.clone();
         thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(gossip_timer));
 
-            if let Err(_) = gossip_trigger.send(Message {
-                src: "".to_string(),
-                dest: "".to_string(),
-                body: MsgBody {
-                    msg_id: None,
-                    in_reply_to: None,
-                    payload: BroadcastPayload::TriggerGossip,
-                },
-            }) {
+            if let Err(_) = gossip_trigger.send(
+                MessageBuilder::empty()
+                    .send_to(node_id.clone())
+                    .src(node_id.clone())
+                    .with_body(None, None, BroadcastPayload::TriggerGossip)
+                    .build(),
+            ) {
                 break;
             }
         });
@@ -76,86 +68,84 @@ impl Node for BroadcastNode {
         match input.body.payload {
             Self::Payload::Broadcast { message } => {
                 self.messages.insert(message);
-                let reply = Message {
-                    src: input.dest.clone(),
-                    dest: input.src,
-                    body: MsgBody {
-                        msg_id: Some(self.msg_id),
-                        in_reply_to: input.body.msg_id,
-                        payload: Self::Payload::BroadcastOk,
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("serialize response to broadcast msg")?;
-                output.write_all(b"\n").context("add newline")?;
+                input
+                    .into_reply(Some(self.msg_id), Self::Payload::BroadcastOk)
+                    .write(&mut *output)?;
                 self.msg_id += 1;
 
                 for node in &self.cluster {
-                    let gossip = Message {
-                        src: input.dest.clone(),
-                        dest: node.to_string(),
-                        body: MsgBody {
-                            msg_id: Some(self.msg_id),
-                            in_reply_to: input.body.msg_id,
-                            payload: Self::Payload::Gossip { message },
-                        },
-                    };
-                    serde_json::to_writer(&mut *output, &gossip).context("serialize gossip msg")?;
-                    output.write_all(b"\n").context("add newline")?;
+                    input
+                        .into_reply(Some(self.msg_id), Self::Payload::Gossip { message })
+                        .send_to(node.clone())
+                        .write(&mut *output)?;
                     self.msg_id += 1;
+                    self.unconfirmed.entry(node.clone()).and_modify(|set| {
+                        set.insert(message);
+                    });
                 }
             }
             Self::Payload::Read => {
-                let reply = Message {
-                    src: input.dest,
-                    dest: input.src,
-                    body: MsgBody {
-                        msg_id: Some(self.msg_id),
-                        in_reply_to: input.body.msg_id,
-                        payload: Self::Payload::ReadOk {
+                input
+                    .into_reply(
+                        Some(self.msg_id),
+                        Self::Payload::ReadOk {
                             messages: self.messages.clone(),
                         },
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("serialize response to read msg")?;
-                output.write_all(b"\n").context("add newline")?;
+                    )
+                    .write(&mut *output)?;
                 self.msg_id += 1;
             }
-            Self::Payload::Topology { topology } => {
+            Self::Payload::Topology { ref topology } => {
                 self.cluster = topology.get(&self.id).unwrap().clone();
-                let reply = Message {
-                    src: input.dest,
-                    dest: input.src,
-                    body: MsgBody {
-                        msg_id: Some(self.msg_id),
-                        in_reply_to: input.body.msg_id,
-                        payload: Self::Payload::TopologyOk,
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("serialize response to topology msg")?;
-                output.write_all(b"\n").context("add newline")?;
+                self.unconfirmed
+                    .extend(self.cluster.iter().map(|n| (n.clone(), HashSet::default())));
+                input
+                    .into_reply(Some(self.msg_id), Self::Payload::TopologyOk)
+                    .write(&mut *output)?;
                 self.msg_id += 1;
             }
             Self::Payload::Gossip { message } => {
                 if self.messages.insert(message) {
                     for node in &self.cluster {
-                        let gossip = Message {
-                            src: input.dest.clone(),
-                            dest: node.to_string(),
-                            body: MsgBody {
-                                msg_id: Some(self.msg_id),
-                                in_reply_to: input.body.msg_id,
-                                payload: Self::Payload::Gossip { message },
-                            },
-                        };
-                        serde_json::to_writer(&mut *output, &gossip)
-                            .context("serialize gossip msg")?;
-                        output.write_all(b"\n").context("add newline")?;
-                        self.msg_id += 1;
+                        if node != &input.src {
+                            input
+                                .into_reply(Some(self.msg_id), Self::Payload::Gossip { message })
+                                .send_to(node.to_string())
+                                .write(&mut *output)?;
+                            self.msg_id += 1;
+                            self.unconfirmed.entry(node.clone()).and_modify(|set| {
+                                set.insert(message);
+                            });
+                        }
                     }
                 };
+
+                input
+                    .into_reply(Some(self.msg_id), BroadcastPayload::GossipOk { message })
+                    .write(&mut *output)?;
+                self.msg_id += 1;
+            }
+            Self::Payload::GossipOk { message } => {
+                self.unconfirmed.entry(input.src).and_modify(|set| {
+                    set.remove(&message);
+                });
+            }
+            Self::Payload::TriggerGossip => {
+                eprintln!("{:?}", &self.unconfirmed);
+                for (node, messages) in &self.unconfirmed {
+                    for message in messages {
+                        MessageBuilder::empty()
+                            .send_to(node.to_string())
+                            .src(self.id.clone())
+                            .with_body(
+                                Some(self.msg_id),
+                                None,
+                                BroadcastPayload::Gossip { message: *message },
+                            )
+                            .write(&mut *output)?;
+                        self.msg_id += 1;
+                    }
+                }
             }
             _ => {}
         }
@@ -163,12 +153,15 @@ impl Node for BroadcastNode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcastPayload {
     TriggerGossip,
     Gossip {
+        message: usize,
+    },
+    GossipOk {
         message: usize,
     },
     Broadcast {

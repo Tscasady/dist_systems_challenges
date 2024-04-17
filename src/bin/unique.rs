@@ -1,7 +1,6 @@
-use anyhow::Context;
 use dist_systems_challenge::*;
 use serde::{Deserialize, Serialize};
-use std::{io::{StdoutLock, Write}, sync::mpsc::Sender};
+use std::{io::StdoutLock, sync::mpsc::Sender};
 
 #[derive(Serialize, Deserialize)]
 struct UniqueNode {
@@ -12,20 +11,10 @@ struct UniqueNode {
 impl Node for UniqueNode {
     type Payload = UniquePayload;
 
-    fn new(msg: Message<InitPayload>, output: &mut StdoutLock, _tx: Sender<Message<UniquePayload>>) -> anyhow::Result<UniqueNode>
+    fn new(mut msg: Message<InitPayload>, output: &mut StdoutLock, _tx: Sender<Message<UniquePayload>>) -> anyhow::Result<UniqueNode>
     {
-        if let InitPayload::Init { node_id, .. } = msg.body.payload {
-            let reply = Message {
-                src: msg.dest,
-                dest: msg.src,
-                body: MsgBody {
-                    msg_id: Some(0),
-                    in_reply_to: msg.body.msg_id,
-                    payload: InitPayload::InitOk
-                }
-            };
-            serde_json::to_writer(&mut *output, &reply).context("serialize response to echo msg")?;
-            output.write_all(b"\n").context("add newline")?;
+        if let InitPayload::Init { node_id, .. } = std::mem::replace(&mut msg.body.payload, InitPayload::Empty) {
+            msg.into_reply(Some(0), InitPayload::InitOk).write(&mut *output)?;
 
             return Ok(UniqueNode {
                 id: node_id,
@@ -38,24 +27,13 @@ impl Node for UniqueNode {
 
     fn reply(
         &mut self,
-        input: dist_systems_challenge::Message<Self::Payload>,
+        input: Message<Self::Payload>,
         output: &mut std::io::StdoutLock,
     ) -> anyhow::Result<()> {
         match input.body.payload {
             Self::Payload::Generate => {
                 let id = self.id.clone() + &self.msg_id.to_string();
-                let reply = Message {
-                    src: self.id.clone(),
-                    dest: input.src,
-                    body: MsgBody {
-                        msg_id: Some(self.msg_id),
-                        in_reply_to: input.body.msg_id,
-                        payload: Self::Payload::GenerateOk { id },
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("serialize response to init msg")?;
-                output.write_all(b"\n").context("add newline")?;
+                input.into_reply(Some(self.msg_id), Self::Payload::GenerateOk { id }).write(&mut *output)?;
                 self.msg_id += 1;
             }
             _ => {}
@@ -64,7 +42,7 @@ impl Node for UniqueNode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum UniquePayload {

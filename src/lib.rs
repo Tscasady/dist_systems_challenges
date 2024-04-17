@@ -1,10 +1,11 @@
+use core::fmt::Debug;
 use anyhow::Context;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{stdin, stdout, StdoutLock, Write};
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Message<Payload> {
     pub src: String,
     pub dest: String,
@@ -12,10 +13,10 @@ pub struct Message<Payload> {
 }
 
 impl<Payload> Message<Payload> {
-    pub fn into_reply(self, id: Option<usize>, payload: Payload) -> MessageBuilder<Payload> {
+    pub fn into_reply(&self, id: Option<usize>, payload: Payload) -> MessageBuilder<Payload> {
         MessageBuilder::empty()
-            .from(self.src)
-            .to(self.dest)
+            .src(self.dest.clone())
+            .send_to(self.src.clone())
             .with_body(id, self.body.msg_id, payload)
     }
 
@@ -41,7 +42,7 @@ pub struct MessageBuilder<Payload> {
 }
 
 impl<Payload> MessageBuilder<Payload> {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         MessageBuilder {
             src: None,
             dest: None,
@@ -49,17 +50,17 @@ impl<Payload> MessageBuilder<Payload> {
         }
     }
 
-    fn to(mut self, dest: String) -> Self {
-        self.src = Some(dest);
-        self
-    }
-
-    fn from(mut self, src: String) -> Self {
+    pub fn send_to(mut self, src: String) -> Self {
         self.dest = Some(src);
         self
     }
 
-    fn with_body(
+    pub fn src(mut self, dest: String) -> Self {
+        self.src = Some(dest);
+        self
+    }
+
+    pub fn with_body(
         mut self,
         msg_id: Option<usize>,
         in_reply_to: Option<usize>,
@@ -81,9 +82,17 @@ impl<Payload> MessageBuilder<Payload> {
         output.write_all(b"\n").context("add newline")?;
         Ok(())
     }
+
+    pub fn build(self) -> Message<Payload> {
+        Message {
+            src: self.src.unwrap(),
+            dest: self.dest.unwrap(),
+            body: self.body.unwrap()
+        }
+    }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct MsgBody<Payload> {
     pub msg_id: Option<usize>,
     pub in_reply_to: Option<usize>,
@@ -91,9 +100,9 @@ pub struct MsgBody<Payload> {
     pub payload: Payload,
 }
 
-pub trait Payload {}
+pub trait Payload: Debug {}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum InitPayload {
@@ -102,6 +111,7 @@ pub enum InitPayload {
         node_ids: Vec<String>,
     },
     InitOk,
+    Empty
 }
 
 impl Payload for InitPayload {}
@@ -156,6 +166,7 @@ where
     });
 
     for input in receiver {
+        eprintln!("{:?}", input);
         node.reply(input, &mut stdout).context("couldn't reply")?
     }
 

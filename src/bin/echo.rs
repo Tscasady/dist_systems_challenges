@@ -23,12 +23,12 @@ impl Node for EchoNode {
 
     fn reply(
         &mut self,
-        mut input: Message<EchoPayload>,
+        input: Message<EchoPayload>,
         output: &mut StdoutLock,
     ) -> anyhow::Result<()> {
-        match std::mem::replace(&mut input.body.payload, EchoPayload::Empty) {
-            EchoPayload::Echo { echo } => {
-                input.into_reply(Some(self.id), EchoPayload::EchoOk { echo }).write(&mut *output)?;
+        match input.body.payload {
+            EchoPayload::Echo { ref echo } => {
+                input.into_reply(Some(self.id), EchoPayload::EchoOk { echo: echo.clone() }).write(&mut *output)?;
                 self.id += 1;
             }
             _ => {}
@@ -37,7 +37,7 @@ impl Node for EchoNode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum EchoPayload {
