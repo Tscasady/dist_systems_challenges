@@ -166,7 +166,6 @@ where
     });
 
     for input in receiver {
-        eprintln!("{:?}", input);
         node.reply(input, &mut stdout).context("couldn't reply")?
     }
 

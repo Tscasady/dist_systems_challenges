@@ -12,35 +12,33 @@ struct BroadcastNode {
     msg_id: usize,
     messages: HashSet<usize>,
     cluster: Vec<String>,
-    unconfirmed: HashMap<String, HashSet<usize>>,
+    confirmed: HashMap<String, HashSet<usize>>,
 }
 
 impl Node for BroadcastNode {
     type Payload = BroadcastPayload;
 
     fn new(
-        mut msg: Message<InitPayload>,
+        msg: Message<InitPayload>,
         output: &mut StdoutLock,
         gossip_trigger: Sender<Message<BroadcastPayload>>,
     ) -> anyhow::Result<BroadcastNode> {
-        let node = if let InitPayload::Init { node_id, .. } =
-            std::mem::replace(&mut msg.body.payload, InitPayload::Empty)
-        {
+        let node = if let InitPayload::Init { ref node_id, .. } = msg.body.payload {
             msg.into_reply(Some(0), InitPayload::InitOk)
                 .write(&mut *output)?;
 
             BroadcastNode {
-                id: node_id,
+                id: node_id.clone(),
                 msg_id: 0,
                 messages: HashSet::new(),
                 cluster: vec![],
-                unconfirmed: HashMap::new(),
+                confirmed: HashMap::new(),
             }
         } else {
             panic!()
         };
 
-        let gossip_timer = 300;
+        let gossip_timer = 1000;
 
         let node_id = node.id.clone();
         thread::spawn(move || loop {
@@ -73,15 +71,22 @@ impl Node for BroadcastNode {
                     .write(&mut *output)?;
                 self.msg_id += 1;
 
+                //consider doing nothing on broadcast, only gossip on a timer
                 for node in &self.cluster {
-                    input
-                        .into_reply(Some(self.msg_id), Self::Payload::Gossip { message })
-                        .send_to(node.clone())
-                        .write(&mut *output)?;
-                    self.msg_id += 1;
-                    self.unconfirmed.entry(node.clone()).and_modify(|set| {
-                        set.insert(message);
-                    });
+                    if !self
+                        .confirmed
+                        .get(node)
+                        .map(|known| known.contains(&message))
+                        .expect("node should be in cluster")
+                    {
+                        let mut messages = HashSet::new();
+                        messages.insert(message);
+                        input
+                            .into_reply(Some(self.msg_id), Self::Payload::Gossip { messages })
+                            .send_to(node.clone())
+                            .write(&mut *output)?;
+                        self.msg_id += 1;
+                    }
                 }
             }
             Self::Payload::Read => {
@@ -97,54 +102,71 @@ impl Node for BroadcastNode {
             }
             Self::Payload::Topology { ref topology } => {
                 self.cluster = topology.get(&self.id).unwrap().clone();
-                self.unconfirmed
+                self.confirmed
                     .extend(self.cluster.iter().map(|n| (n.clone(), HashSet::default())));
                 input
                     .into_reply(Some(self.msg_id), Self::Payload::TopologyOk)
                     .write(&mut *output)?;
                 self.msg_id += 1;
             }
-            Self::Payload::Gossip { message } => {
-                if self.messages.insert(message) {
-                    for node in &self.cluster {
-                        if node != &input.src {
-                            input
-                                .into_reply(Some(self.msg_id), Self::Payload::Gossip { message })
-                                .send_to(node.to_string())
-                                .write(&mut *output)?;
-                            self.msg_id += 1;
-                            self.unconfirmed.entry(node.clone()).and_modify(|set| {
-                                set.insert(message);
-                            });
+            Self::Payload::Gossip { ref messages } => {
+                self.confirmed.entry(input.src.clone()).and_modify(|set| {
+                    set.extend(messages.clone());
+                });
+
+                for message in messages.iter() {
+                    if self.messages.insert(*message) {
+                        for node in &self.cluster {
+                            if node != &input.src {
+                                let mut messages = HashSet::new();
+                                messages.insert(*message);
+                                input
+                                    .into_reply(
+                                        Some(self.msg_id),
+                                        Self::Payload::Gossip { messages },
+                                    )
+                                    .send_to(node.to_string())
+                                    .write(&mut *output)?;
+                                self.msg_id += 1;
+                            }
                         }
                     }
-                };
-
-                input
-                    .into_reply(Some(self.msg_id), BroadcastPayload::GossipOk { message })
-                    .write(&mut *output)?;
-                self.msg_id += 1;
+                }
             }
-            Self::Payload::GossipOk { message } => {
-                self.unconfirmed.entry(input.src).and_modify(|set| {
-                    set.remove(&message);
-                });
+            Self::Payload::Share { known } => {
+                for (node, message) in known {
+                    self.confirmed
+                        .entry(node)
+                        .and_modify(|set| set.extend(message));
+                }
             }
             Self::Payload::TriggerGossip => {
-                eprintln!("{:?}", &self.unconfirmed);
-                for (node, messages) in &self.unconfirmed {
-                    for message in messages {
-                        MessageBuilder::empty()
-                            .send_to(node.to_string())
-                            .src(self.id.clone())
-                            .with_body(
-                                Some(self.msg_id),
-                                None,
-                                BroadcastPayload::Gossip { message: *message },
-                            )
-                            .write(&mut *output)?;
-                        self.msg_id += 1;
-                    }
+                for (node, known) in &self.confirmed {
+                    MessageBuilder::empty()
+                        .send_to(node.to_string())
+                        .src(self.id.clone())
+                        .with_body(
+                            Some(self.msg_id),
+                            None,
+                            BroadcastPayload::Gossip {
+                                messages: self.messages.difference(known).cloned().collect(),
+                            },
+                        )
+                        .write(&mut *output)?;
+                    self.msg_id += 1;
+
+                    MessageBuilder::empty()
+                        .send_to(node.to_string())
+                        .src(self.id.clone())
+                        .with_body(
+                            Some(self.msg_id),
+                            None,
+                            BroadcastPayload::Share {
+                                known: self.confirmed.clone(),
+                            },
+                        )
+                        .write(&mut *output)?;
+                    self.msg_id += 1;
                 }
             }
             _ => {}
@@ -159,10 +181,10 @@ impl Node for BroadcastNode {
 pub enum BroadcastPayload {
     TriggerGossip,
     Gossip {
-        message: usize,
+        messages: HashSet<usize>,
     },
-    GossipOk {
-        message: usize,
+    Share {
+        known: HashMap<String, HashSet<usize>>,
     },
     Broadcast {
         message: usize,
